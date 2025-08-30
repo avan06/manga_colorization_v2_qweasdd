@@ -12,7 +12,7 @@ this program. If not, see <http://www.gnu.org/licenses/>.
 """
 import torch.nn as nn
 from torch.autograd import Variable
-import denoising.functions as functions
+from . import functions
     
 class UpSampleFeatures(nn.Module):
     r"""Implements the last layer of FFDNet

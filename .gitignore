@@ -6,3 +6,5 @@ __pycache__/
 temp_colorization/
 
 static/temp_images/
+
+.vs

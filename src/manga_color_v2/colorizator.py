@@ -1,24 +1,53 @@
+import cv2
 import torch
-from torchvision.transforms import ToTensor
+import types
 import numpy as np
+from PIL import Image
+from torchvision.transforms import ToTensor
 
-from networks.models import Colorizer
-from denoising.denoiser import FFDNetDenoiser
-from utils.utils import resize_pad
+from .networks.models import Colorizer
+from .denoising.denoiser import FFDNetDenoiser, normalize, variable_to_cv2_image
+from .utils.utils import resize_pad
 
 class MangaColorizator:
-    def __init__(self, device, generator_path = 'networks/generator.zip', extractor_path = 'networks/extractor.pth'):
+    def __init__(self, device, generator_path = 'networks/generator.zip', denoising_dir = 'networks/'):
         self.colorizer = Colorizer().to(device)
-        self.colorizer.generator.load_state_dict(torch.load(generator_path, map_location = device))
+        state_dict = torch.load(generator_path, map_location = device, weights_only=False)
+        self.colorizer.generator.load_state_dict(state_dict)
         self.colorizer = self.colorizer.eval()
         
-        self.denoiser = FFDNetDenoiser(device)
-        
+        self.denoiser = FFDNetDenoiser(device, _weights_dir=denoising_dir)
+
         self.current_image = None
         self.current_hint = None
         self.current_pad = None
-        
+
         self.device = device
+
+
+    def denoise_only(self, image_np, sigma=25):
+        """
+        Denoises a full-resolution image and returns it at its original size.
+        It handles resizing for the denoiser and resizing back.
+        """
+        if not isinstance(image_np, np.ndarray):
+            raise TypeError("Input must be a numpy array.")
+
+        original_h, original_w, _ = image_np.shape
+
+        # Perform denoising using the (now patched) method
+        denoised_image = self.denoiser.get_denoised_image(image_np, sigma=sigma)
+
+        # Resize the clean image back to its original dimensions if it was scaled down
+        if denoised_image.shape[0] != original_h or denoised_image.shape[1] != original_w:
+            if issubclass(denoised_image.dtype.type, np.floating):
+                 denoised_image = (denoised_image * 255).astype(np.uint8)
+            denoised_pil = Image.fromarray(denoised_image)
+            restored_pil = denoised_pil.resize((original_w, original_h), Image.Resampling.LANCZOS)
+            return np.array(restored_pil, dtype=np.float32) / 255.0
+        else:
+            return denoised_image
+
         
     def set_image(self, image, size = 576, apply_denoise = True, denoise_sigma = 25, transform = ToTensor()):
         if (size % 32 != 0):
@@ -40,7 +69,7 @@ class MangaColorizator:
         
         if issubclass(hint.dtype.type, np.integer):
             hint = hint.astype('float32') / 255
-            
+
         hint = (hint - 0.5) / 0.5
         hint = torch.FloatTensor(hint).permute(2, 0, 1)
         mask = torch.FloatTensor(np.expand_dims(mask, 0))

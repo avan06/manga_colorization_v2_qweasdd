@@ -1,11 +1,9 @@
 import os
 import argparse
-import sys
 
-import numpy as np
 import matplotlib.pyplot as plt
 
-from colorizator import MangaColorizator
+from .colorizator import MangaColorizator
 
 def process_image(image, colorizator, args):
     colorizator.set_image(image, args.size, args.denoiser, args.denoiser_sigma)

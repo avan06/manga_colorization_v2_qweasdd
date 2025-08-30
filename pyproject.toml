@@ -1,0 +1,25 @@
+[project]
+name = "manga_colorization_v2_qweasdd"
+version = "0.1.0"
+description = "This project, originally developed by qweasdd, is a tool for coloring manga. In this version, support for pyproject.toml has been added, along with several improvements and adjustments."
+authors = [
+    { name = "avan06" }
+]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch",
+    "torchvision",
+    "opencv-python",
+    "matplotlib",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
