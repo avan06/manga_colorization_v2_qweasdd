@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
+from torch.utils.checkpoint import checkpoint
 
 from .extractor import SEResNeXt_Origin, BottleneckX_Origin
 
@@ -182,6 +183,8 @@ class FeatureConv(nn.Module):
 class Generator(nn.Module):
     def __init__(self, ngf=64):
         super(Generator, self).__init__()
+        
+        self.use_checkpoint = False
 
         self.encoder = SEResNeXt_Origin(BottleneckX_Origin, [3, 4, 6, 3], num_classes= 370, input_channels=1)
         
@@ -287,22 +290,37 @@ class Generator(nn.Module):
         aux_out = self.to2(aux_out)
         aux_out = self.to3(aux_out)
         
+        # To use the encoder inside a checkpoint, we need to treat it as a whole
+        # or ensure that x1, x2, x3, x4 do not need to retain gradients 
+        # during the backward pass in the tunnel.
+        # Here, the encoder output is directly fed into the tunnel,
+        # so the gradients must be preserved.
+        # Therefore, we execute the encoder first.
         x1, x2, x3, x4 = self.encoder(sketch[:, 0:1])
         
-        out = self.tunnel4(torch.cat([x4, aux_out], 1))
-        
-        
-        
-        x = self.tunnel3(torch.cat([out, x3], 1))
-        
-        x = self.tunnel2(torch.cat([x, x2, x1], 1))
-        
-        
+        # Use checkpoint only when in training mode (self.training is True) and the switch is enabled.
+        if self.training and self.use_checkpoint:
+            # Wrap computationally intensive tunnel layers with checkpoint
+            # checkpoint takes a function and its inputs
+            # We use lambda to simplify the call
+            # Explicitly pass the parameter use_reentrant=False to suppress the warning and use the recommended implementation.
+            out = checkpoint(self.tunnel4, torch.cat([x4, aux_out], 1), use_reentrant=False)
+            x = checkpoint(self.tunnel3, torch.cat([out, x3], 1), use_reentrant=False)
+            x = checkpoint(self.tunnel2, torch.cat([x, x2, x1], 1), use_reentrant=False)
+        else:
+            # In evaluation mode or when checkpointing is disabled,
+            # execute the standard forward pass
+            out = self.tunnel4(torch.cat([x4, aux_out], 1))
+            x = self.tunnel3(torch.cat([out, x3], 1))
+            x = self.tunnel2(torch.cat([x, x2, x1], 1))
+
         x = torch.tanh(self.exit(torch.cat([x, x0], 1)))
         
+        # deconv_for_decoder is also relatively resource-intensive,
+        # but for now, we only checkpoint the tunnels to test the effect
         decoder_output = self.deconv_for_decoder(out)
 
-        return x, decoder_output  
+        return x, decoder_output
 
 
 class Colorizer(nn.Module):
