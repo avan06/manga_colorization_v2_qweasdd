@@ -1,6 +1,6 @@
 [project]
 name = "manga_colorization_v2_qweasdd"
-version = "0.1.1"
+version = "0.2.0"
 description = "This project, originally developed by qweasdd, is a tool for coloring manga. In this version, support for pyproject.toml has been added, along with several improvements and adjustments."
 authors = [
     { name = "avan06" }

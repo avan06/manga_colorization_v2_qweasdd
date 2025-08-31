@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
+from torch.nn.utils import spectral_norm
 from torch.utils.checkpoint import checkpoint
 
 from .extractor import SEResNeXt_Origin, BottleneckX_Origin
@@ -130,7 +131,7 @@ class ResNeXtBottleneck(nn.Module):
         
         x = self.shortcut.forward(x)
         return x + bottleneck
-    
+
 class SpectrResNeXtBottleneck(nn.Module):
     def __init__(self, in_channels=256, out_channels=256, stride=1, cardinality=32, dilate=1):
         super(SpectrResNeXtBottleneck, self).__init__()
@@ -332,3 +333,151 @@ class Colorizer(nn.Module):
     def forward(self, x, extractor_grad = False):
         fake, guide = self.generator(x)
         return fake, guide
+
+
+# =================================================================================
+#  The following is the newly added Discriminator-related code.
+#  Inspired by NetD from AlacGAN (https://github.com/orashi/AlacGAN)
+# =================================================================================
+
+# You can directly use PyTorch's built-in spectral_norm without manually implementing the SpectralNorm class.
+# However, to maintain consistency with the style of AlacGAN/Tag2Pix and to be able to apply it to non-Conv/Linear layers,
+# an implementation of SelayerSpectr is provided here.
+
+class SelayerSpectr(nn.Module):
+    def __init__(self, inplanes):
+        super(SelayerSpectr, self).__init__()
+        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
+        # Wrap convolutional layers with spectral_norm
+        self.conv1 = spectral_norm(nn.Conv2d(inplanes, inplanes // 16, kernel_size=1, stride=1))
+        self.conv2 = spectral_norm(nn.Conv2d(inplanes // 16, inplanes, kernel_size=1, stride=1))
+        self.relu = nn.ReLU(inplace=True)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        out = self.global_avgpool(x)
+        out = self.conv1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.sigmoid(out)
+        return x * out
+
+
+class ResNeXtBottleneck_D(nn.Module):
+    """
+    A ResNeXt Bottleneck module designed specifically for the discriminator.
+    It differs slightly from the version in the generator, mainly in the
+    activation function and network depth.
+    Added Spectral Normalization and SELayer.
+    """
+    def __init__(self, in_channels=256, out_channels=256, stride=1, cardinality=8, dilate=1):
+        super(ResNeXtBottleneck_D, self).__init__()
+        D = out_channels // 2
+        self.out_channels = out_channels
+        
+        # Use PyTorch's official spectral_norm function to wrap the convolutional layers directly
+        self.conv_reduce = spectral_norm(nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False))
+        self.conv_conv = spectral_norm(nn.Conv2d(D, D, kernel_size=2 + stride, stride=stride, padding=dilate, dilation=dilate,
+                                                 groups=cardinality, bias=False))
+        self.conv_expand = spectral_norm(nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False))
+        
+        self.shortcut = nn.Sequential()
+        if stride != 1:
+            # Using AvgPool2d for downsampling, which is simpler and more effective than convolution
+            self.shortcut.add_module('shortcut_pool', nn.AvgPool2d(2, stride=2))
+        
+        # Added SELayer
+        self.selayer = SelayerSpectr(out_channels)
+
+    def forward(self, x):
+        bottleneck = self.conv_reduce(x)
+        bottleneck = F.leaky_relu(bottleneck, 0.2, inplace=True)
+        bottleneck = self.conv_conv(bottleneck)
+        bottleneck = F.leaky_relu(bottleneck, 0.2, inplace=True)
+        bottleneck = self.conv_expand(bottleneck)
+        
+        # Apply SELayer before the residual connection
+        bottleneck = self.selayer(bottleneck)
+        
+        # Residual connection
+        return self.shortcut(x) + bottleneck
+
+
+class Discriminator(nn.Module):
+    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024):
+        """
+        ndf: Number of base feature maps in the discriminator
+        input_nc: Number of channels in the input image (3 for a color image)
+        sketch_feature_nc: Number of channels in the sketch feature map from the generator's Encoder
+        """
+        super(Discriminator, self).__init__()
+        # Add a property to control whether to use checkpoint
+        self.use_checkpoint = False
+
+        # Part 1: Process the color image with progressive downsampling
+        self.feed = nn.Sequential(
+            # input: (batch, 3, 512, 512)
+            nn.Conv2d(input_nc, ndf, kernel_size=7, stride=1, padding=3, bias=False),  # -> (batch, 64, 512, 512)
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(ndf, ndf, kernel_size=4, stride=2, padding=1, bias=False),  # -> (batch, 64, 256, 256)
+            nn.LeakyReLU(0.2, True),
+
+            ResNeXtBottleneck_D(ndf, ndf, cardinality=8, dilate=1),
+            ResNeXtBottleneck_D(ndf, ndf, cardinality=8, dilate=1, stride=2),  # -> (batch, 64, 128, 128)
+            nn.Conv2d(ndf, ndf * 2, kernel_size=1, stride=1, padding=0, bias=False), # -> (batch, 128, 128, 128)
+            nn.LeakyReLU(0.2, True),
+
+            ResNeXtBottleneck_D(ndf * 2, ndf * 2, cardinality=8, dilate=1),
+            ResNeXtBottleneck_D(ndf * 2, ndf * 2, cardinality=8, dilate=1, stride=2),  # -> (batch, 128, 64, 64)
+            nn.Conv2d(ndf * 2, ndf * 4, kernel_size=1, stride=1, padding=0, bias=False), # -> (batch, 256, 64, 64)
+            nn.LeakyReLU(0.2, True),
+            
+            # Remove the last downsampling, change stride from 2 to 1
+            # This makes the output feature map size 64x64, which matches sketch_feat (x4)
+            ResNeXtBottleneck_D(ndf * 4, ndf * 4, cardinality=8, dilate=1, stride=1),
+        )
+
+        # Part 2: Fuse sketch features and image features
+        # Input channels = image features (ndf*4) + sketch features (sketch_feature_nc)
+        # AlacGAN's NetI outputs 512 channels, while our Encoder's x4 outputs 1024, so an adjustment is needed here.
+        self.fuse = nn.Sequential(
+            nn.Conv2d(ndf * 4 + sketch_feature_nc, ndf * 8, kernel_size=3, stride=1, padding=1, bias=False), # -> (batch, 512, 64, 64)
+            nn.LeakyReLU(0.2, True),
+            ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 32, 32)
+            ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 16, 16)
+            ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 8, 8)
+        )
+        
+        # Final output layer
+        # Since the output size of fuse becomes 8x8, the kernel size here needs to be adjusted to 8
+        # to compress the 8x8 feature map into a 1x1 score
+        self.output = nn.Conv2d(ndf * 8, 1, kernel_size=8, stride=1, padding=0, bias=False) # -> (batch, 1, 1, 1)
+
+    def forward(self, color_image, sketch_features):
+        """
+        color_image: (batch, 3, H, W) The real or generated color image
+        sketch_features: (batch, 1024, H/16, W/16) Sketch features (x4) extracted from the generator's encoder
+        """
+        # Process the image
+        if self.training and self.use_checkpoint:
+            # When checkpointing is enabled, use it to execute the computationally intensive parts
+            image_feat = checkpoint(self.feed, color_image, use_reentrant=False)
+            combined_feat = torch.cat([image_feat, sketch_features], 1)
+            fused_output = checkpoint(self.fuse, combined_feat, use_reentrant=False)
+        else:
+            # Execute normally
+            image_feat = self.feed(color_image)
+        
+            # Fuse features
+            # Concatenate along the channel dimension using torch.cat
+            # Now image_feat (64x64) and sketch_features (64x64) have matching dimensions
+            combined_feat = torch.cat([image_feat, sketch_features], 1)
+        
+            # Process the fused features
+            fused_output = self.fuse(combined_feat)
+        
+        # Get the final score
+        score = self.output(fused_output)
+        
+        # Return a scalar score
+        return score.view(-1)
