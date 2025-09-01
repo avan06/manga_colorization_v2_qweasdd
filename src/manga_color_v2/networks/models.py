@@ -9,64 +9,6 @@ from .extractor import SEResNeXt_Origin, BottleneckX_Origin
 
 '''https://github.com/orashi/AlacGAN/blob/master/models/standard.py'''
 
-def l2normalize(v, eps=1e-12):
-    return v / (v.norm() + eps)
-
-
-class SpectralNorm(nn.Module):
-    def __init__(self, module, name='weight', power_iterations=1):
-        super(SpectralNorm, self).__init__()
-        self.module = module
-        self.name = name
-        self.power_iterations = power_iterations
-        if not self._made_params():
-            self._make_params()
-
-    def _update_u_v(self):
-        u = getattr(self.module, self.name + "_u")
-        v = getattr(self.module, self.name + "_v")
-        w = getattr(self.module, self.name + "_bar")
-
-        height = w.data.shape[0]
-        for _ in range(self.power_iterations):
-            v.data = l2normalize(torch.mv(torch.t(w.view(height,-1).data), u.data))
-            u.data = l2normalize(torch.mv(w.view(height,-1).data, v.data))
-
-        # sigma = torch.dot(u.data, torch.mv(w.view(height,-1).data, v.data))
-        sigma = u.dot(w.view(height, -1).mv(v))
-        setattr(self.module, self.name, w / sigma.expand_as(w))
-
-    def _made_params(self):
-        try:
-            u = getattr(self.module, self.name + "_u")
-            v = getattr(self.module, self.name + "_v")
-            w = getattr(self.module, self.name + "_bar")
-            return True
-        except AttributeError:
-            return False
-
-
-    def _make_params(self):
-        w = getattr(self.module, self.name)
-        height = w.data.shape[0]
-        width = w.view(height, -1).data.shape[1]
-
-        u = Parameter(w.data.new(height).normal_(0, 1), requires_grad=False)
-        v = Parameter(w.data.new(width).normal_(0, 1), requires_grad=False)
-        u.data = l2normalize(u.data)
-        v.data = l2normalize(v.data)
-        w_bar = Parameter(w.data)
-
-        del self.module._parameters[self.name]
-
-        self.module.register_parameter(self.name + "_u", u)
-        self.module.register_parameter(self.name + "_v", v)
-        self.module.register_parameter(self.name + "_bar", w_bar)
-
-
-    def forward(self, *args):
-        self._update_u_v()
-        return self.module.forward(*args)
 
 class Selayer(nn.Module):
     def __init__(self, inplanes):
@@ -90,8 +32,8 @@ class SelayerSpectr(nn.Module):
     def __init__(self, inplanes):
         super(SelayerSpectr, self).__init__()
         self.global_avgpool = nn.AdaptiveAvgPool2d(1)
-        self.conv1 = SpectralNorm(nn.Conv2d(inplanes, inplanes // 16, kernel_size=1, stride=1))
-        self.conv2 = SpectralNorm(nn.Conv2d(inplanes // 16, inplanes, kernel_size=1, stride=1))
+        self.conv1 = spectral_norm(nn.Conv2d(inplanes, inplanes // 16, kernel_size=1, stride=1))
+        self.conv2 = spectral_norm(nn.Conv2d(inplanes // 16, inplanes, kernel_size=1, stride=1))
         self.relu = nn.ReLU(inplace=True)
         self.sigmoid = nn.Sigmoid()
 
@@ -132,34 +74,7 @@ class ResNeXtBottleneck(nn.Module):
         x = self.shortcut.forward(x)
         return x + bottleneck
 
-class SpectrResNeXtBottleneck(nn.Module):
-    def __init__(self, in_channels=256, out_channels=256, stride=1, cardinality=32, dilate=1):
-        super(SpectrResNeXtBottleneck, self).__init__()
-        D = out_channels // 2
-        self.out_channels = out_channels
-        self.conv_reduce = SpectralNorm(nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False))
-        self.conv_conv = SpectralNorm(nn.Conv2d(D, D, kernel_size=2 + stride, stride=stride, padding=dilate, dilation=dilate,
-                                   groups=cardinality,
-                                   bias=False))
-        self.conv_expand = SpectralNorm(nn.Conv2d(D, out_channels, kernel_size=1, stride=1, padding=0, bias=False))
-        self.shortcut = nn.Sequential()
-        if stride != 1:
-            self.shortcut.add_module('shortcut',
-                                     nn.AvgPool2d(2, stride=2))
-            
-        self.selayer = SelayerSpectr(out_channels)
 
-    def forward(self, x):
-        bottleneck = self.conv_reduce.forward(x)
-        bottleneck = F.leaky_relu(bottleneck, 0.2, True)
-        bottleneck = self.conv_conv.forward(bottleneck)
-        bottleneck = F.leaky_relu(bottleneck, 0.2, True)
-        bottleneck = self.conv_expand.forward(bottleneck)
-        bottleneck = self.selayer(bottleneck)
-        
-        x = self.shortcut.forward(x)
-        return x + bottleneck
-    
 class FeatureConv(nn.Module):
     def __init__(self, input_dim=512, output_dim=512):
         super(FeatureConv, self).__init__()
@@ -340,28 +255,6 @@ class Colorizer(nn.Module):
 #  Inspired by NetD from AlacGAN (https://github.com/orashi/AlacGAN)
 # =================================================================================
 
-# You can directly use PyTorch's built-in spectral_norm without manually implementing the SpectralNorm class.
-# However, to maintain consistency with the style of AlacGAN/Tag2Pix and to be able to apply it to non-Conv/Linear layers,
-# an implementation of SelayerSpectr is provided here.
-
-class SelayerSpectr(nn.Module):
-    def __init__(self, inplanes):
-        super(SelayerSpectr, self).__init__()
-        self.global_avgpool = nn.AdaptiveAvgPool2d(1)
-        # Wrap convolutional layers with spectral_norm
-        self.conv1 = spectral_norm(nn.Conv2d(inplanes, inplanes // 16, kernel_size=1, stride=1))
-        self.conv2 = spectral_norm(nn.Conv2d(inplanes // 16, inplanes, kernel_size=1, stride=1))
-        self.relu = nn.ReLU(inplace=True)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        out = self.global_avgpool(x)
-        out = self.conv1(out)
-        out = self.relu(out)
-        out = self.conv2(out)
-        out = self.sigmoid(out)
-        return x * out
-
 
 class ResNeXtBottleneck_D(nn.Module):
     """
@@ -373,7 +266,6 @@ class ResNeXtBottleneck_D(nn.Module):
     def __init__(self, in_channels=256, out_channels=256, stride=1, cardinality=8, dilate=1):
         super(ResNeXtBottleneck_D, self).__init__()
         D = out_channels // 2
-        self.out_channels = out_channels
         
         # Use PyTorch's official spectral_norm function to wrap the convolutional layers directly
         self.conv_reduce = spectral_norm(nn.Conv2d(in_channels, D, kernel_size=1, stride=1, padding=0, bias=False))
