@@ -21,7 +21,8 @@ from manga_color_v2.colorizator import MangaColorizator
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 # networks_v2_path: the file path to the "networks generator.zip"
 # denoiser_v2_dir: the directory containing the "net_rgb.pth" file
-manga_colorizator_v2 = MangaColorizator(_device, networks_v2_path, denoiser_v2_dir)
+# target_resolution: The target resolution, e.g., 512.
+manga_colorizator_v2 = MangaColorizator(_device, networks_v2_path, denoiser_v2_dir, target_resolution=512)
 ```
 
 ## Inference
@@ -29,14 +30,25 @@ manga_colorizator_v2 = MangaColorizator(_device, networks_v2_path, denoiser_v2_d
 ```python
 source_pil = Image.open(manga_file.name).convert("RGB")
 source_np = np.array(source_pil)
-manga_colorizator_v2.set_image(source_np, size=576, apply_denoise=True, denoise_sigma=25)
-colorization_lowres_np = manga_colorizator_v2.colorize()
+# Set apply_denoise to True to enable denoising. denoise_sigma controls the strength of denoising.
+manga_colorizator_v2.set_image(source_np, apply_denoise=True, denoise_sigma=25)
+# use_original_l: Outputs images at the original resolution. Con: May slightly alter style and can reveal noise from the original image.
+colorization_lowres_np = manga_colorizator_v2.colorize(use_original_l=True)
 colorized_image_np = (colorization_lowres_np * 255).astype(np.uint8)
 ```
 
-___
+
+## Credits
+
+*   **[Tag2Pix](https://github.com/blandocs/Tag2Pix/)**: A Generative Adversarial Network (GAN) based method that colors line art based on text tags.
+*   **[AlacGAN](https://github.com/orashi/AlacGAN)**: A user-guided deep learning model for coloring anime line art.
+*   **[manga-colorization-v2](https://github.com/qweasdd/manga-colorization-v2)**: This project aims to provide a feature for automatically colorizing black and white manga using AI. It integrates components from the aforementioned projects to achieve its colorization capabilities. The `extractor.py` file, used for image feature extraction, originates from Tag2Pix, while the `models.py` file, which contains the neural network model architecture, is derived from AlacGAN.
+
+
 ___
 
+##
+##
 ## **UPD!!!** **A demo of Manga Colorization v2.5 is now available [link](https://mangacol.com). Feel free to check it out!**
 
 

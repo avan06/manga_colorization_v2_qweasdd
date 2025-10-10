@@ -99,10 +99,10 @@ class FeatureConv(nn.Module):
         return self.network(x)
     
 class Generator(nn.Module):
-    def __init__(self, ngf=64):
+    def __init__(self, ngf=64, use_checkpoint: bool = False,):
         super(Generator, self).__init__()
         
-        self.use_checkpoint = False
+        self.use_checkpoint = use_checkpoint
 
         self.encoder = SEResNeXt_Origin(BottleneckX_Origin, [3, 4, 6, 3], num_classes= 370, input_channels=1)
         
@@ -123,62 +123,80 @@ class Generator(nn.Module):
             nn.Tanh(),
         )
 
-        tunnel4 = nn.Sequential(*[ResNeXtBottleneck(512, 512, cardinality=32, dilate=1) for _ in range(20)])
+        # --- Splitting Tunnel 4 ---
+        self.tunnel4_pre = nn.Sequential(
+            nn.Conv2d(1024 + 128, 512, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True)
+        )
+        self.tunnel4_blocks = nn.ModuleList(
+            [ResNeXtBottleneck(512, 512, cardinality=32, dilate=1) for _ in range(20)]
+        )
+        self.tunnel4_post = nn.Sequential(
+            nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.LeakyReLU(0.2, True)
+        ) # 64x64 output
 
-        
-        self.tunnel4 = nn.Sequential(nn.Conv2d(1024 + 128, 512, kernel_size=3, stride=1, padding=1),
-                                     nn.LeakyReLU(0.2, True),
-                                     tunnel4,
-                                     nn.Conv2d(512, 1024, kernel_size=3, stride=1, padding=1),
-                                     nn.PixelShuffle(2),
-                                     nn.LeakyReLU(0.2, True)
-                                     )  # 64
-
+        # --- Splitting Tunnel 3 ---
         depth = 2
-        tunnel = [ResNeXtBottleneck(256, 256, cardinality=32, dilate=1) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(256, 256, cardinality=32, dilate=2) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(256, 256, cardinality=32, dilate=4) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(256, 256, cardinality=32, dilate=2),
-                   ResNeXtBottleneck(256, 256, cardinality=32, dilate=1)]
-        tunnel3 = nn.Sequential(*tunnel)
+        self.tunnel3_pre = nn.Sequential(
+            nn.Conv2d(512 + 256, 256, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True)
+        )
+        self.tunnel3_blocks = nn.ModuleList([
+            ResNeXtBottleneck(256, 256, cardinality=32, dilate=1) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(256, 256, cardinality=32, dilate=2) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(256, 256, cardinality=32, dilate=4) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(256, 256, cardinality=32, dilate=2),
+            ResNeXtBottleneck(256, 256, cardinality=32, dilate=1)
+        ])
+        self.tunnel3_post = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.LeakyReLU(0.2, True)
+        ) # 128x128 output
 
-        self.tunnel3 = nn.Sequential(nn.Conv2d(512 + 256, 256, kernel_size=3, stride=1, padding=1),
-                                     nn.LeakyReLU(0.2, True),
-                                     tunnel3,
-                                     nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
-                                     nn.PixelShuffle(2),
-                                     nn.LeakyReLU(0.2, True)
-                                     )  # 128
+        # --- Splitting Tunnel 2 ---
+        self.tunnel2_pre = nn.Sequential(
+            nn.Conv2d(128 + 256 + 64, 128, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True)
+        )
+        self.tunnel2_blocks = nn.ModuleList([
+            ResNeXtBottleneck(128, 128, cardinality=32, dilate=1) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(128, 128, cardinality=32, dilate=2) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(128, 128, cardinality=32, dilate=4) for _ in range(depth)
+        ] + [
+            ResNeXtBottleneck(128, 128, cardinality=32, dilate=2),
+            ResNeXtBottleneck(128, 128, cardinality=32, dilate=1)
+        ])
+        self.tunnel2_post = nn.Sequential(
+            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.LeakyReLU(0.2, True)
+        ) # 256x256 output
 
-        tunnel = [ResNeXtBottleneck(128, 128, cardinality=32, dilate=1) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(128, 128, cardinality=32, dilate=2) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(128, 128, cardinality=32, dilate=4) for _ in range(depth)]
-        tunnel += [ResNeXtBottleneck(128, 128, cardinality=32, dilate=2),
-                   ResNeXtBottleneck(128, 128, cardinality=32, dilate=1)]
-        tunnel2 = nn.Sequential(*tunnel)
-
-        self.tunnel2 = nn.Sequential(nn.Conv2d(128 + 256 + 64, 128, kernel_size=3, stride=1, padding=1),
-                                     nn.LeakyReLU(0.2, True),
-                                     tunnel2,
-                                     nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-                                     nn.PixelShuffle(2),
-                                     nn.LeakyReLU(0.2, True)
-                                     )
-
-        tunnel = [ResNeXtBottleneck(64, 64, cardinality=16, dilate=1)]
-        tunnel += [ResNeXtBottleneck(64, 64, cardinality=16, dilate=2)]
-        tunnel += [ResNeXtBottleneck(64, 64, cardinality=16, dilate=4)]
-        tunnel += [ResNeXtBottleneck(64, 64, cardinality=16, dilate=2),
-                   ResNeXtBottleneck(64, 64, cardinality=16, dilate=1)]
-        tunnel1 = nn.Sequential(*tunnel)
-
-        self.tunnel1 = nn.Sequential(nn.Conv2d(64 + 32, 64, kernel_size=3, stride=1, padding=1),
-                                     nn.LeakyReLU(0.2, True),
-                                     tunnel1,
-                                     nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-                                     nn.PixelShuffle(2),
-                                     nn.LeakyReLU(0.2, True)
-                                     )
+        # --- Splitting Tunnel 1 (for consistency) ---
+        self.tunnel1_pre = nn.Sequential(
+            nn.Conv2d(64 + 32, 64, kernel_size=3, stride=1, padding=1),
+            nn.LeakyReLU(0.2, True)
+        )
+        self.tunnel1_blocks = nn.ModuleList([
+            ResNeXtBottleneck(64, 64, cardinality=16, dilate=1),
+            ResNeXtBottleneck(64, 64, cardinality=16, dilate=2),
+            ResNeXtBottleneck(64, 64, cardinality=16, dilate=4),
+            ResNeXtBottleneck(64, 64, cardinality=16, dilate=2),
+            ResNeXtBottleneck(64, 64, cardinality=16, dilate=1)
+        ])
+        self.tunnel1_post = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.PixelShuffle(2),
+            nn.LeakyReLU(0.2, True)
+        ) # This tunnel is not used in the final version, but the structure is retained
 
         self.exit = nn.Sequential(nn.Conv2d(64 + 32, 32, kernel_size=3, stride=1, padding=1),
                                  nn.LeakyReLU(0.2, True),
@@ -216,27 +234,42 @@ class Generator(nn.Module):
         # Therefore, we execute the encoder first.
         x1, x2, x3, x4 = self.encoder(sketch[:, 0:1])
         
+        # --- Tunnel 4 ---
+        out = self.tunnel4_pre(torch.cat([x4, aux_out], 1))
         # Use checkpoint only when in training mode (self.training is True) and the switch is enabled.
         if self.training and self.use_checkpoint:
-            # Wrap computationally intensive tunnel layers with checkpoint
-            # checkpoint takes a function and its inputs
-            # We use lambda to simplify the call
-            # Explicitly pass the parameter use_reentrant=False to suppress the warning and use the recommended implementation.
-            out = checkpoint(self.tunnel4, torch.cat([x4, aux_out], 1), use_reentrant=False)
-            x = checkpoint(self.tunnel3, torch.cat([out, x3], 1), use_reentrant=False)
-            x = checkpoint(self.tunnel2, torch.cat([x, x2, x1], 1), use_reentrant=False)
+            for block in self.tunnel4_blocks:
+                out = checkpoint(block, out, use_reentrant=False)
         else:
-            # In evaluation mode or when checkpointing is disabled,
-            # execute the standard forward pass
-            out = self.tunnel4(torch.cat([x4, aux_out], 1))
-            x = self.tunnel3(torch.cat([out, x3], 1))
-            x = self.tunnel2(torch.cat([x, x2, x1], 1))
+            for block in self.tunnel4_blocks:
+                out = block(out)
+        out_tunnel4_result = self.tunnel4_post(out) # Store the final output of tunnel4
 
+        # --- Tunnel 3 ---
+        x = self.tunnel3_pre(torch.cat([out_tunnel4_result, x3], 1))
+        if self.training and self.use_checkpoint:
+            for block in self.tunnel3_blocks:
+                x = checkpoint(block, x, use_reentrant=False)
+        else:
+            for block in self.tunnel3_blocks:
+                x = block(x)
+        x = self.tunnel3_post(x)
+
+        # --- Tunnel 2 ---
+        x = self.tunnel2_pre(torch.cat([x, x2, x1], 1))
+        if self.training and self.use_checkpoint:
+            for block in self.tunnel2_blocks:
+                x = checkpoint(block, x, use_reentrant=False)
+        else:
+            for block in self.tunnel2_blocks:
+                x = block(x)
+        x = self.tunnel2_post(x)
+
+        # Final output
         x = torch.tanh(self.exit(torch.cat([x, x0], 1)))
         
-        # deconv_for_decoder is also relatively resource-intensive,
-        # but for now, we only checkpoint the tunnels to test the effect
-        decoder_output = self.deconv_for_decoder(out)
+        # deconv_for_decoder uses the output of tunnel4
+        decoder_output = self.deconv_for_decoder(out_tunnel4_result)
         
         # Add this conditional return statement
         if return_feats:
@@ -246,10 +279,10 @@ class Generator(nn.Module):
 
 
 class Colorizer(nn.Module):
-    def __init__(self):
+    def __init__(self, use_checkpoint: bool = False,):
         super(Colorizer, self).__init__()
         
-        self.generator = Generator()
+        self.generator = Generator(use_checkpoint=use_checkpoint,)
         
     def forward(self, x, return_feats: bool=False):
         if return_feats:
@@ -306,7 +339,7 @@ class ResNeXtBottleneck_D(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024):
+    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024, use_checkpoint: bool = False,):
         """
         ndf: Number of base feature maps in the discriminator
         input_nc: Number of channels in the input image (3 for a color image)
@@ -314,7 +347,7 @@ class Discriminator(nn.Module):
         """
         super(Discriminator, self).__init__()
         # Add a property to control whether to use checkpoint
-        self.use_checkpoint = False
+        self.use_checkpoint = use_checkpoint
 
         # Part 1: Process the color image with progressive downsampling
         self.feed = nn.Sequential(
@@ -351,9 +384,13 @@ class Discriminator(nn.Module):
         )
         
         # Final output layer
-        # Since the output size of fuse becomes 8x8, the kernel size here needs to be adjusted to 8
-        # to compress the 8x8 feature map into a 1x1 score
-        self.output = nn.Conv2d(ndf * 8, 1, kernel_size=8, stride=1, padding=0, bias=False) # -> (batch, 1, 1, 1)
+        self.output = nn.Sequential(
+            # 1. Adaptive average pooling layer to convert any HxW input to 1x1
+            nn.AdaptiveAvgPool2d((1, 1)),
+            # 2. Use a 1x1 convolution layer to produce the final 1-channel score
+            nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=False)
+        )
+
 
     def forward(self, color_image, sketch_features):
         """
@@ -379,7 +416,7 @@ class Discriminator(nn.Module):
             fused_output = self.fuse(combined_feat)
         
         # Get the final score
-        score = self.output(fused_output)
+        score = self.output(fused_output) # (batch, 1, 1, 1)
         
         # Return a scalar score
         return score.view(-1)
