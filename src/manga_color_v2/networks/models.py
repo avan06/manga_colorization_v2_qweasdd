@@ -1,3 +1,5 @@
+# manga_color_v2/networks/models.py
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -199,7 +201,7 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
         )    
         
-    def forward(self, sketch):
+    def forward(self, sketch, return_feats=False): # Add return_feats parameter
 
         x0 = self.to0(sketch)
         aux_out = self.to1(x0)
@@ -235,8 +237,12 @@ class Generator(nn.Module):
         # deconv_for_decoder is also relatively resource-intensive,
         # but for now, we only checkpoint the tunnels to test the effect
         decoder_output = self.deconv_for_decoder(out)
-
-        return x, decoder_output
+        
+        # Add this conditional return statement
+        if return_feats:
+            return x, decoder_output, x4
+        else:
+            return x, decoder_output
 
 
 class Colorizer(nn.Module):
@@ -245,9 +251,13 @@ class Colorizer(nn.Module):
         
         self.generator = Generator()
         
-    def forward(self, x, extractor_grad = False):
-        fake, guide = self.generator(x)
-        return fake, guide
+    def forward(self, x, return_feats: bool=False):
+        if return_feats:
+            fake, guide, sketch_feat = self.generator(x, return_feats=True)
+            return fake, guide, sketch_feat
+        else:
+            fake, guide = self.generator(x)
+            return fake, guide
 
 
 # =================================================================================

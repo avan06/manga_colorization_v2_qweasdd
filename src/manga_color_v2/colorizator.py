@@ -1,3 +1,5 @@
+# manga_color_v2/colorizator.py
+
 import cv2
 import torch
 import types
