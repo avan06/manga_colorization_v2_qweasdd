@@ -8,7 +8,7 @@ from PIL import Image
 from torchvision.transforms import ToTensor
 
 from .networks.models import Colorizer
-from .denoising.denoiser import FFDNetDenoiser, normalize, variable_to_cv2_image
+from .denoising.denoiser import FFDNetDenoiser
 from .utils.utils import resize_pad
 
 class MangaColorizator:
@@ -27,36 +27,40 @@ class MangaColorizator:
         self.device = device
 
 
-    def denoise_only(self, image_np, sigma=25):
+    def denoise_only(self, image_np: np.ndarray, sigma: int = 25, denoise_max_size: int = -1) -> np.ndarray:
         """
-        Denoises a full-resolution image and returns it at its original size.
-        It handles resizing for the denoiser and resizing back.
+        Denoise a full-resolution image (numpy) using FFDNet and return RGB float32 [0,1].
+        This method will preserve original size (it will internally resize/restore if needed).
+
+        Args:
+            image_np (np.ndarray): Input numpy image.
+            sigma (int, optional): Denoising strength. Defaults to 25.
+            denoise_max_size (int, optional): Maximum edge length allowed for denoising. -1 means no scaling. Defaults to -1 (no scaling).
         """
         if not isinstance(image_np, np.ndarray):
-            raise TypeError("Input must be a numpy array.")
+            raise TypeError("Input must be a numpy array")
 
-        original_h, original_w, _ = image_np.shape
+        # Use the denoiser's helper which already handles resizing & conversion to RGB [0,1]
+        denoised = self.denoiser.get_denoised_image(image_np, sigma=sigma, max_size=denoise_max_size)
 
-        # Perform denoising using the (now patched) method
-        denoised_image = self.denoiser.get_denoised_image(image_np, sigma=sigma)
-
-        # Resize the clean image back to its original dimensions if it was scaled down
-        if denoised_image.shape[0] != original_h or denoised_image.shape[1] != original_w:
-            if issubclass(denoised_image.dtype.type, np.floating):
-                 denoised_image = (denoised_image * 255).astype(np.uint8)
-            denoised_pil = Image.fromarray(denoised_image)
-            restored_pil = denoised_pil.resize((original_w, original_h), Image.Resampling.LANCZOS)
-            return np.array(restored_pil, dtype=np.float32) / 255.0
-        else:
-            return denoised_image
+        # Ensure dtype float32 and in [0,1]
+        denoised = denoised.astype(np.float32)
+        if denoised.max() > 1.2:
+            denoised = denoised / 255.0
+        denoised = np.clip(denoised, 0.0, 1.0)
+        return denoised
 
         
-    def set_image(self, image, size = 576, apply_denoise = True, denoise_sigma = 25, transform = ToTensor()):
+    def set_image(self, image, size = 576, apply_denoise: bool = True, denoise_sigma: int = 25, denoise_max_size: int = -1, transform = ToTensor(),):
         if (size % 32 != 0):
             raise RuntimeError("size is not divisible by 32")
         
         if apply_denoise:
-            image = self.denoiser.get_denoised_image(image, sigma = denoise_sigma)
+            # denoise_only returns float32 in [0,1]
+            denoised_float = self.denoise_only(image, sigma=denoise_sigma, denoise_max_size=denoise_max_size)
+            # Convert to uint8 for storage and consistent processing
+            image = (denoised_float * 255.0).round().astype(np.uint8)
+            # image = self.denoiser.get_denoised_image(image, sigma = denoise_sigma)
         
         image, self.current_pad = resize_pad(image, size)
         self.current_image = transform(image).unsqueeze(0).to(self.device)

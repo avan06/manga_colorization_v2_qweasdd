@@ -10,8 +10,8 @@ version 3 of the License, or (at your option) any later
 version. You should have received a copy of this license along
 this program. If not, see <http://www.gnu.org/licenses/>.
 """
+import torch
 import torch.nn as nn
-from torch.autograd import Variable
 from . import functions
     
 class UpSampleFeatures(nn.Module):
@@ -93,8 +93,14 @@ class FFDNet(nn.Module):
         self.upsamplefeatures = UpSampleFeatures()
 
     def forward(self, x, noise_sigma):
-        concat_noise_x = functions.concatenate_input_noise_map(x.data, noise_sigma.data)
-        concat_noise_x = Variable(concat_noise_x)
+        # Ensure noise_sigma is a tensor on the same device/dtype
+        if not isinstance(noise_sigma, torch.Tensor):
+            noise_sigma = torch.tensor(noise_sigma, device=x.device, dtype=x.dtype)
+        else:
+            noise_sigma = noise_sigma.to(device=x.device, dtype=x.dtype)
+
+        concat_noise_x = functions.concatenate_input_noise_map(x, noise_sigma)
+        # no Variable, keep it as modern tensor (autograd will work correctly)
         h_dncnn = self.intermediate_dncnn(concat_noise_x)
         pred_noise = self.upsamplefeatures(h_dncnn)
         return pred_noise
