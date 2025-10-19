@@ -143,16 +143,19 @@ class Generator(nn.Module):
             nn.Conv2d(512 + 256, 256, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, True)
         )
-        self.tunnel3_blocks = nn.ModuleList([
-            ResNeXtBottleneck(256, 256, cardinality=32, dilate=1) for _ in range(depth)
-        ] + [
-            ResNeXtBottleneck(256, 256, cardinality=32, dilate=2) for _ in range(depth)
-        ] + [
-            ResNeXtBottleneck(256, 256, cardinality=32, dilate=4) for _ in range(depth)
-        ] + [
+        # Build tunnel3 blocks and insert Dropout2d in the middle (instead of nn.Dropout)
+        tunnel3_modules = []
+        tunnel3_modules.extend([ResNeXtBottleneck(256, 256, cardinality=32, dilate=1) for _ in range(depth)])
+        tunnel3_modules.extend([ResNeXtBottleneck(256, 256, cardinality=32, dilate=2) for _ in range(depth)])
+        # Insert spatial dropout (Dropout2d) as regularizer for conv feature maps
+        # This layer has no effect during inference (model.eval()).
+        tunnel3_modules.append(nn.Dropout2d(p=0.1))
+        tunnel3_modules.extend([ResNeXtBottleneck(256, 256, cardinality=32, dilate=4) for _ in range(depth)])
+        tunnel3_modules.extend([
             ResNeXtBottleneck(256, 256, cardinality=32, dilate=2),
             ResNeXtBottleneck(256, 256, cardinality=32, dilate=1)
         ])
+        self.tunnel3_blocks = nn.ModuleList(tunnel3_modules)
         self.tunnel3_post = nn.Sequential(
             nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
             nn.PixelShuffle(2),
@@ -164,16 +167,18 @@ class Generator(nn.Module):
             nn.Conv2d(128 + 256 + 64, 128, kernel_size=3, stride=1, padding=1),
             nn.LeakyReLU(0.2, True)
         )
-        self.tunnel2_blocks = nn.ModuleList([
-            ResNeXtBottleneck(128, 128, cardinality=32, dilate=1) for _ in range(depth)
-        ] + [
-            ResNeXtBottleneck(128, 128, cardinality=32, dilate=2) for _ in range(depth)
-        ] + [
-            ResNeXtBottleneck(128, 128, cardinality=32, dilate=4) for _ in range(depth)
-        ] + [
+        # Build tunnel2 blocks and insert Dropout2d in the middle (instead of nn.Dropout)
+        tunnel2_modules = []
+        tunnel2_modules.extend([ResNeXtBottleneck(128, 128, cardinality=32, dilate=1) for _ in range(depth)])
+        tunnel2_modules.extend([ResNeXtBottleneck(128, 128, cardinality=32, dilate=2) for _ in range(depth)])
+        # Insert spatial dropout (Dropout2d) as regularizer for conv feature maps
+        tunnel2_modules.append(nn.Dropout2d(p=0.1))
+        tunnel2_modules.extend([ResNeXtBottleneck(128, 128, cardinality=32, dilate=4) for _ in range(depth)])
+        tunnel2_modules.extend([
             ResNeXtBottleneck(128, 128, cardinality=32, dilate=2),
             ResNeXtBottleneck(128, 128, cardinality=32, dilate=1)
         ])
+        self.tunnel2_blocks = nn.ModuleList(tunnel2_modules)
         self.tunnel2_post = nn.Sequential(
             nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
             nn.PixelShuffle(2),

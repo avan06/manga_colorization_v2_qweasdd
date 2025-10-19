@@ -1,6 +1,7 @@
 # manga_color_v2/colorizator.py
 
 import os
+import re
 import cv2
 import torch
 import torch.nn as nn
@@ -16,132 +17,308 @@ from .denoising.denoiser import FFDNetDenoiser
 
 def load_weights_intelligently(model, source, device='cpu'):
     """
-    A smarter, side-effect-free, and versatile weight loading function.
-    - `source` can be a file path (str) or a pre-loaded state dictionary.
-    - Intelligently extracts the correct state_dict.
-    - Tries multiple key name translation strategies to handle 'module.' prefixes and model structure changes.
-    - Only loads weights when both the key name and shape match.
+    Improved intelligent loader:
+      - Accepts path or state-dict
+      - Extracts nested 'state_dict' / 'netG_state_dict' etc.
+      - Normalizes 'module.' prefixes
+      - Remaps old monolithic tunnel.* -> tunnelX_pre / tunnelX_blocks / tunnelX_post
+      - Aligns checkpoint tunnel_blocks indices to model tunnel_blocks indices by SEQUENTIAL MAPPING
+        (this handles dropout insertion automatically because dropout has no params and thus no keys)
+      - Verifies tensor shapes before assigning
+      - Loads using strict=False and reports stats
     """
+    # --- load source into `raw_sd` ---
     if isinstance(source, str): # If a path is passed
         if not os.path.exists(source):
             print(f"\n[Loader] Warning: Path does not exist, skipping. Path: {source}")
             return
         print(f"\n[Loader] Attempting to load weights from: {os.path.basename(source)}")
-        source_dict = torch.load(source, map_location=device)
+        raw = torch.load(source, map_location=device)
     elif isinstance(source, dict): # If an already loaded dictionary is passed
-        source_dict = source
+        raw = source
     else:
         print(f"\n[Loader] Error: Source must be a path or a dictionary, but got {type(source)}.")
         return
 
-    # --- Intelligent state_dict extraction ---
-    target_key = None
-    if isinstance(model, (Colorizer, nn.Module)): # Assuming Generator also inherits from nn.Module
-        target_key = 'netG_state_dict'
+    # Extract nested state_dict if present
+    dict_to_load = raw
+    if isinstance(raw, dict):
+        # prefer model-type-specific keys if possible
+        potential_keys = ['state_dict', 'model', 'weight', 'netG_state_dict', 'netD_state_dict', 'generator', 'discriminator']
+        for k in potential_keys:
+            if k in raw and isinstance(raw[k], dict):
+                dict_to_load = raw[k]
+                print(f"[Loader] -> Extracted '{k}' from checkpoint.")
+                break
 
-    # Create a copy to operate on, to avoid modifying the original state
-    dict_to_load = source_dict.copy()
+    # copy to mutable dict
+    sd = dict(dict_to_load)
 
-    # Try to extract the relevant state_dict from the checkpoint
-    if isinstance(dict_to_load, dict):
-        # Prioritize using the key determined by the model type
-        if target_key and target_key in dict_to_load:
-            dict_to_load = dict_to_load[target_key]
-            print(f"[Loader] -> Extracted '{target_key}' based on model type.")
-        else:
-            # If the specific key is not found, try common keys in order
-            potential_keys = ['state_dict', 'model', 'weight', 'netG_state_dict', 'generator']
-            for key in potential_keys:
-                if key in dict_to_load:
-                    dict_to_load = dict_to_load.get(key, dict_to_load) # Safely get, fallback to original
-                    print(f"[Loader] -> Extracted generic key '{key}'.")
-                    break
-    
-    target_model_dict = model.state_dict()
-    new_state_dict = OrderedDict()
+    # normalize keys helper: remove common wrappers like 'module.' or 'model.' at start
+    def normalize_keys(sd_in):
+        out = OrderedDict()
+        for k, v in sd_in.items():
+            nk = k
+            # remove leading 'module.' once
+            if nk.startswith('module.'):
+                nk = nk[len('module.'):]
+            # remove leading 'model.' once
+            if nk.startswith('model.'):
+                nk = nk[len('model.'):]
+            out[nk] = v
+        return out
+
+    sd = normalize_keys(sd)
+
+    # target model state_dict
+    target_sd = model.state_dict()
+
+    # helper: gather indices for prefix like 'tunnel3_blocks' but accounting for full prefix
+    # returns a mapping of full_prefix -> sorted index-list
+    def find_prefixes_with_indices(keys, simple_name):
+        """
+        Scan keys and find candidate full prefixes that end with simple_name, returning
+        dict: full_prefix -> sorted list of integer indices found after that prefix.
+        Example: key "generator.tunnel3_blocks.0.conv_reduce.weight"
+                 simple_name "tunnel3_blocks"
+                 full_prefix = "generator.tunnel3_blocks"
+                 index = 0
+        """
+        res = {}
+        pat = re.compile(r'(^|\.)((?:[\w\-]+\.)*' + re.escape(simple_name) + r')\.(\d+)\.')
+        for k in keys:
+            m = pat.search(k)
+            if m:
+                full_pref = m.group(2)  # e.g. 'generator.tunnel3_blocks' or 'tunnel3_blocks'
+                idx = int(m.group(3))
+                res.setdefault(full_pref, set()).add(idx)
+        # convert sets to sorted lists
+        for p in list(res.keys()):
+            res[p] = sorted(list(res[p]))
+        return res
+
+    # ---------- REMAP OLD MONOLITHIC TUNNELS ----------
+    # If checkpoint contains keys like 'tunnel4.2.0.conv_reduce.weight' but not 'tunnel4_pre'
+    def remap_old_monolithic(sd_in):
+        sd_new = dict(sd_in)  # shallow copy
+        for i in [4, 3, 2, 1]:
+            old_base = f'tunnel{i}'
+            # detect presence of old style (e.g., 'tunnel4.2.0.conv_reduce.weight')
+            has_old = any(k.startswith(old_base + '.') for k in sd_in.keys())
+            has_new_pre = any(old_base + '_pre' in k for k in sd_in.keys())
+            if has_old and not has_new_pre:
+                # remap conv at index 0 -> tunnelX_pre.0.*
+                for k in list(sd_in.keys()):
+                    if k.startswith(f'{old_base}.0.'):
+                        newk = k.replace(f'{old_base}.0.', f'{old_base}_pre.0.')
+                        sd_new[newk] = sd_in[k]
+                        # optionally remove old key later
+                # remap inner blocks at index 2 -> tunnelX_blocks.<b>.
+                for k in list(sd_in.keys()):
+                    m = re.match(re.escape(old_base) + r'\.2\.(\d+)\.(.*)', k)
+                    if m:
+                        bidx = int(m.group(1))
+                        rest = m.group(2)
+                        newk = f'{old_base}_blocks.{bidx}.{rest}'
+                        sd_new[newk] = sd_in[k]
+                # remap tail conv at index 3 -> tunnelX_post.0.
+                for k in list(sd_in.keys()):
+                    if k.startswith(f'{old_base}.3.'):
+                        newk = k.replace(f'{old_base}.3.', f'{old_base}_post.0.')
+                        sd_new[newk] = sd_in[k]
+                # remove old keys that we remapped (safe: do this on sd_new after adding)
+                for k in list(sd_in.keys()):
+                    if k.startswith(old_base + '.'):
+                        sd_new.pop(k, None)
+                # move to next tunnel
+        return sd_new
+
+    sd = remap_old_monolithic(sd)
+
+    # Normalize keys again (in case remap inserted 'module.' weirdly) - keep deterministic ordering
+    sd = normalize_keys(sd)
+
+    # ---------- Precompute candidate tunnel prefixes in source and model ----------
+    tunnels_simple = ['tunnel4_blocks', 'tunnel3_blocks', 'tunnel2_blocks', 'tunnel1_blocks']
+    src_prefix_map = {}
+    tgt_prefix_map = {}
+    for t in tunnels_simple:
+        src_map = find_prefixes_with_indices(sd.keys(), t)
+        tgt_map = find_prefixes_with_indices(target_sd.keys(), t)
+        # pick first found prefix (if any) - but keep full map for fallback
+        src_prefix_map[t] = src_map  # dict: full_prefix -> [indices]
+        tgt_prefix_map[t] = tgt_map
+
+    # ---------- Begin building new_state (only assign when shapes match) ----------
+    new_state = OrderedDict()
     loaded_count = 0
-    
-    # --- Try multiple key name translation strategies ---
-    for k_source, v_source in dict_to_load.items():
-        k_target_found = None
-        
-        # Strategy 1: Direct match
-        if k_source in target_model_dict:
-            k_target_found = k_source
-        
-        # Strategy 2: Remove 'module.' prefix from the source
-        if not k_target_found:
-            k_candidate = k_source.replace('module.', '')
-            if k_candidate in target_model_dict:
-                k_target_found = k_candidate
+    skipped_shape = []
+    assigned_src_keys = set()
 
-        # Strategy 3: Add 'module.' prefix to the target key (to handle DataParallel)
-        if not k_target_found:
-            k_candidate = 'module.' + k_source
-            if k_candidate in target_model_dict:
-                k_target_found = k_candidate
-        
-        # Strategy 4: [Most Important] Handle internal '.module.' introduced by CheckpointWrapper
-        # e.g., source: '...layer1.0.conv1...', target: '...layer1.0.module.conv1...'
-        if not k_target_found:
-            parts = k_source.split('.')
+    # 1) Direct mapping attempts (exact key, remove/add module/model prefixes)
+    def try_direct_mappings():
+        nonlocal loaded_count
+        for k_src, v_src in list(sd.items()):
+            if k_src in target_sd:
+                if tuple(v_src.shape) == tuple(target_sd[k_src].shape):
+                    new_state[k_src] = v_src.clone()
+                    loaded_count += 1
+                    assigned_src_keys.add(k_src)
+                else:
+                    skipped_shape.append((k_src, v_src.shape, target_sd[k_src].shape))
+                    assigned_src_keys.add(k_src)
+            else:
+                # try removing 'module.' or adding
+                if k_src.startswith('module.'):
+                    candidate = k_src[len('module.'):]
+                    if candidate in target_sd and tuple(sd[k_src].shape) == tuple(target_sd[candidate].shape):
+                        new_state[candidate] = sd[k_src].clone()
+                        loaded_count += 1
+                        assigned_src_keys.add(k_src)
+                        continue
+                candidate = 'module.' + k_src
+                if candidate in target_sd and tuple(sd[k_src].shape) == tuple(target_sd[candidate].shape):
+                    new_state[candidate] = sd[k_src].clone()
+                    loaded_count += 1
+                    assigned_src_keys.add(k_src)
+                    continue
+        # end direct mapping
+
+    try_direct_mappings()
+
+    # 2) Tunnel block sequential alignment mapping (robust Dropout handling)
+    for simple_t in tunnels_simple:
+        src_map = src_prefix_map.get(simple_t, {})
+        tgt_map = tgt_prefix_map.get(simple_t, {})
+
+        # iterate all possible prefix pairs (common_name in src_map vs model)
+        for src_pref, src_indices in src_map.items():
+            # Try to find best matching target prefix in model (same simple_t)
+            # If multiple options exist in model, pick the one with largest intersection heuristically.
+            best_tgt_pref = None
+            best_score = -1
+            for tgt_pref, tgt_indices in tgt_map.items():
+                # score by min(len(src_indices), len(tgt_indices)) as heuristic
+                score = min(len(src_indices), len(tgt_indices))
+                if score > best_score:
+                    best_score = score
+                    best_tgt_pref = tgt_pref
+            if best_tgt_pref is None:
+                continue
+
+            src_idxs = src_indices
+            tgt_idxs = tgt_map[best_tgt_pref]  # model indices that HAVE params (dropout indices absent)
+            if not src_idxs or not tgt_idxs:
+                continue
+
+            # Align sequentially: zip src_idxs -> tgt_idxs
+            paired = list(zip(src_idxs, tgt_idxs))
+            # If lengths differ, we'll map as many as possible (front alignment).
+            for s_idx, t_idx in paired:
+                s_prefix = f'{src_pref}.{s_idx}.'
+                t_prefix = f'{best_tgt_pref}.{t_idx}.'
+                # copy every key in sd that starts with s_prefix -> with t_prefix
+                for k, v in sd.items():
+                    if k.startswith(s_prefix):
+                        new_key = k.replace(s_prefix, t_prefix, 1)
+                        if new_key in target_sd:
+                            if tuple(v.shape) == tuple(target_sd[new_key].shape):
+                                new_state[new_key] = v.clone()
+                                loaded_count += 1
+                                assigned_src_keys.add(k)
+                            else:
+                                skipped_shape.append((k, v.shape, target_sd[new_key].shape))
+                                assigned_src_keys.add(k)
+
+    # 3) Additional heuristic transforms: insert 'module' at arbitrary positions (to handle CheckpointWrapper.module insertion)
+    # We'll attempt limited attempts: try inserting 'module' between any two segments in src key and check match.
+    def try_inserting_module():
+        nonlocal loaded_count
+        for k_src, v_src in list(sd.items()):
+            if k_src in assigned_src_keys:
+                continue
+            parts = k_src.split('.')
             for i in range(1, len(parts)):
-                # Try inserting 'module' at different positions
-                k_candidate = '.'.join(parts[:i] + ['module'] + parts[i:])
-                if k_candidate in target_model_dict:
-                    k_target_found = k_candidate
+                candidate = '.'.join(parts[:i] + ['module'] + parts[i:])
+                if candidate in target_sd and tuple(v_src.shape) == tuple(target_sd[candidate].shape):
+                    new_state[candidate] = v_src.clone()
+                    loaded_count += 1
+                    assigned_src_keys.add(k_src)
+                    break
+                # also try removing 'module' if present in candidate
+                if candidate.startswith('module.'):
+                    c2 = candidate[len('module.'):]
+                    if c2 in target_sd and tuple(v_src.shape) == tuple(target_sd[c2].shape):
+                        new_state[c2] = v_src.clone()
+                        loaded_count += 1
+                        assigned_src_keys.add(k_src)
+                        break
+
+    try_inserting_module()
+
+    # 4) Lastly, try matching by suffix patterns (fallback)
+    def try_suffix_match():
+        nonlocal loaded_count
+        # build map suffix->target keys for quick lookup (limit suffix length to keep safe)
+        suffix_map = {}
+        for k in target_sd.keys():
+            parts = k.split('.')
+            for s_len in (3,4,5):  # try matching last 3-5 segments
+                if len(parts) >= s_len:
+                    suf = '.'.join(parts[-s_len:])
+                    suffix_map.setdefault(suf, []).append(k)
+        for k_src, v_src in list(sd.items()):
+            if k_src in assigned_src_keys:
+                continue
+            parts_src = k_src.split('.')
+            matched = False
+            for s_len in (3,4,5):
+                if len(parts_src) >= s_len:
+                    suf = '.'.join(parts_src[-s_len:])
+                    if suf in suffix_map:
+                        for candidate in suffix_map[suf]:
+                            if tuple(v_src.shape) == tuple(target_sd[candidate].shape):
+                                new_state[candidate] = v_src.clone()
+                                loaded_count += 1
+                                assigned_src_keys.add(k_src)
+                                matched = True
+                                break
+                if matched:
                     break
 
-        # --- Strategy 5: Handle transition from old structure (single Sequential) to new structure (pre/blocks/post) ---
-        if not k_target_found:
-            k_candidate = k_source
-            was_transformed = False
-            for i in [4, 3, 2, 1]:
-                # Rule 1: Transform the blocks part (the main transformation)
-                # e.g., 'tunnel4.2.' -> 'tunnel4_blocks.'
-                if f'tunnel{i}.2.' in k_candidate:
-                    k_candidate = k_candidate.replace(f'tunnel{i}.2.', f'tunnel{i}_blocks.')
-                    was_transformed = True
-                
-                # Rule 2: Transform the first Conv layer of the pre part
-                # e.g., 'tunnel4.0.' -> 'tunnel4_pre.0.'
-                elif f'tunnel{i}.0.' in k_candidate:
-                    k_candidate = k_candidate.replace(f'tunnel{i}.0.', f'tunnel{i}_pre.0.')
-                    was_transformed = True
-                
-                # Rule 3: Transform the Conv layer of the post part
-                # e.g., 'tunnel4.3.' -> 'tunnel4_post.0.'
-                elif f'tunnel{i}.3.' in k_candidate:
-                    k_candidate = k_candidate.replace(f'tunnel{i}.3.', f'tunnel{i}_post.0.')
-                    was_transformed = True
-                
-                if was_transformed:
-                    break # Once a transformation is successful, break the loop for i
+    try_suffix_match()
 
-            if was_transformed and k_candidate in target_model_dict:
-                k_target_found = k_candidate
-        
-        # If a matching key name is found, and the shape also matches, prepare to load it
-        if k_target_found and v_source.shape == target_model_dict[k_target_found].shape:
-            new_state_dict[k_target_found] = v_source
-            loaded_count += 1
+    # Actually load
 
-    # Safely load using strict=False
-    missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
-    
+    # Summary + load
+    # Directly load weights using new_state; strict=False ignores mismatched keys and returns differences.
+    # This call simultaneously loads weights and retrieves missing/unexpected keys.
+    missing_keys, unexpected_keys = model.load_state_dict(new_state, strict=False)
+
     print(f"[Loader] For model '{type(model).__name__}':")
-    print(f"  - Successfully loaded {loaded_count} / {len(target_model_dict)} parameter tensors.")
+    print(f"  - Successfully prepared {loaded_count} parameter tensors for loading (shape-checked).")
+
+    if skipped_shape:
+        print(f"  - Skipped {len(skipped_shape)} keys due to shape mismatch (examples: {skipped_shape[:3]}).")
+        
+    # Use the returned values from a single load_state_dict call for reporting
+    # Count successfully loaded parameters
+    successfully_loaded_count = sum(1 for k in new_state if k in target_sd and k not in unexpected_keys)
+    print(f"  - Successfully loaded {successfully_loaded_count} / {len(target_sd)} parameter tensors.")
+
     if missing_keys:
-        # Show only the first few as an example
         print(f"  - Ignored {len(missing_keys)} keys from target model (e.g., {missing_keys[:3]}...).")
+
     if unexpected_keys:
         print(f"  - Ignored {len(unexpected_keys)} keys from source file (e.g., {unexpected_keys[:3]}...).")
-    
-    # If after all strategies, the number of loaded weights is still 0, give a clear warning.
-    if loaded_count == 0 and len(dict_to_load) > 0:
-        print(f"  - [Warning] No compatible weights were loaded. Model remains as is.")
-        print(f"  - Example key from source file: '{next(iter(dict_to_load.keys()))}'")
-        print(f"  - Example key from target model: '{next(iter(target_model_dict.keys()))}'")
+        
+    # Check whether any weights were actually loaded
+    if loaded_count == 0 and len(sd) > 0:
+        example_src = next(iter(sd.keys()))
+        example_tgt = next(iter(target_sd.keys()))
+        print(f"  - [Warning] No compatible weights were assigned. Example source key: '{example_src}'. Example target key: '{example_tgt}'")
+
+    return
 
 
 class MangaColorizator:
@@ -157,6 +334,8 @@ class MangaColorizator:
     ):
         self.colorizer = Colorizer().to(device)
 
+        # In inference, we load weights directly into the generator submodule,
+        # which is what the training script saves as the inference model.
         load_weights_intelligently(self.colorizer.generator, source=generator_path, device=device)
         
         self.colorizer = self.colorizer.eval()
