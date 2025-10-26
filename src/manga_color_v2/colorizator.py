@@ -347,8 +347,8 @@ class MangaColorizator:
         self.current_pad = None
         # store the original image
         self.original_image = None
-        # Store the scan artifact detection result
-        self.scan_artifacts_detected = None
+        # Store the calculated scan artifact SCOR
+        self.scan_artifact_score = 0.0
 
         self.device = device
         
@@ -455,6 +455,7 @@ class MangaColorizator:
 
     def set_image(self, image, apply_denoise: bool = True, denoise_sigma: int = 25, denoise_max_size: int = -1,
                       descreen_for_model_input: str = 'auto', descreen_strength_for_input: float = 0.9,
+                      pre_processing_descreen_threshold: float = 1.35,
                       transform=ToTensor()):
         """
         Set the current image for colorization, with optional denoising and descreening preprocessing.
@@ -493,15 +494,19 @@ class MangaColorizator:
         
         apply_input_descreening = False
         if descreen_for_model_input == 'force_on':
+            print("[Info] Performing descreening preprocessing for model input...")
             apply_input_descreening = True
         elif descreen_for_model_input == 'auto':
             # Extract the L channel from the copy for detection and store the result in self.scan_artifacts_detected
             l_for_detect = cv2.cvtColor(image_for_model, cv2.COLOR_RGB2GRAY)
-            apply_input_descreening = self._detect_scan_artifacts(l_for_detect)
-            self.scan_artifacts_detected = apply_input_descreening
+            self.scan_artifact_score = self._calculate_scan_artifact_score(l_for_detect)
+            if self.scan_artifact_score > pre_processing_descreen_threshold:
+                print(f"[Info] Pre-processing descreen triggered (Score {self.scan_artifact_score:.2f} > Strict Threshold {pre_processing_descreen_threshold}).")
+                apply_input_descreening = True
+            else:
+                print(f"[Info] Pre-processing descreen skipped (Score {self.scan_artifact_score:.2f} <= Strict Threshold {pre_processing_descreen_threshold}).")
         
         if apply_input_descreening:
-            print("[Info] Performing descreening preprocessing for model input...")
             # --- Use the LAB method to separate and recombine the L channel ---
             # 1. Convert image_for_model to LAB color space
             lab_image_for_model = cv2.cvtColor(image_for_model, cv2.COLOR_RGB2LAB)
@@ -551,6 +556,9 @@ class MangaColorizator:
         input_image = cv2.cvtColor(padded_image, cv2.COLOR_RGB2GRAY)[:, :, np.newaxis]
         
         self.current_image = transform(input_image).unsqueeze(0).to(self.device)
+
+        print(f"[MangaColorizator] Image prepared for model. Original size: ({w_orig}, {h_orig}), Resized to: ({new_w}, {new_h}), Padded to bucket: ({bucket_w}, {bucket_h}). Final tensor shape: {self.current_image.shape}")
+
         self.current_hint = torch.zeros(1, 4, self.current_image.shape[2], self.current_image.shape[3]).float().to(self.device)
 
     def update_hint(self, hint, mask):
@@ -569,54 +577,59 @@ class MangaColorizator:
 
         self.current_hint = torch.cat([hint * mask, mask], 0).unsqueeze(0).to(self.device)
 
-    def _detect_scan_artifacts(self, l_channel_uint8: np.ndarray, threshold_ratio: float = 1.5, center_mask_ratio: float = 0.1) -> bool:
-            """
-            Detects periodic scan artifacts in the image using Fast Fourier Transform (FFT).
+    def _calculate_scan_artifact_score(self, l_channel_uint8: np.ndarray, center_mask_ratio: float = 0.15) -> float:
+        """
+        Detects periodic scan artifacts in the image using Fast Fourier Transform (FFT).
+        Calculates a score representing the likelihood of periodic scan artifacts.
+        Instead of returning a boolean, it returns the ratio of the peak to the average,
+        which can then be compared against different thresholds.
 
-            Args:
-                l_channel_uint8 (np.ndarray): The original L channel (uint8).
-                threshold_ratio (float): The ratio threshold of the spectral peak to the average. Values above this are considered anomalous.
-                center_mask_ratio (float): The radius ratio of the central area of the spectrum to be masked.
+        Args:
+            l_channel_uint8 (np.ndarray): The original L channel (uint8) to analyze.
+            center_mask_ratio (float): The radius ratio of the central area of the spectrum to be masked.
 
-            Returns:
-                bool: Returns True if scan artifacts are detected, otherwise False.
-            """
-            # 1. Perform Fourier Transform
-            f = np.fft.fft2(l_channel_uint8)
-            fshift = np.fft.fftshift(f)
-            magnitude_spectrum = np.log(np.abs(fshift) + 1)
+        Returns:
+            float: The calculated artifact score. A higher score means more likely to have artifacts.
+                   Returns 0.0 if calculation is not possible.
+        """
+        # 1. Perform Fourier Transform
+        f = np.fft.fft2(l_channel_uint8)
+        fshift = np.fft.fftshift(f)
+        magnitude_spectrum = np.log(np.abs(fshift) + 1)
 
-            rows, cols = l_channel_uint8.shape
-            crow, ccol = rows // 2, cols // 2
+        rows, cols = l_channel_uint8.shape
+        crow, ccol = rows // 2, cols // 2
 
-            # 2. Create a uint8 mask to ignore the normal signal in the center of the spectrum (low frequencies)
-            mask_radius = int(min(crow, ccol) * center_mask_ratio)
+        # 2. Create a uint8 mask to ignore the normal signal in the center of the spectrum (low frequencies)
+        mask_radius = int(min(crow, ccol) * center_mask_ratio)
         
-            # Change dtype from bool to np.uint8
-            mask = np.ones(magnitude_spectrum.shape, dtype=np.uint8)
+        # Change dtype from bool to np.uint8
+        mask = np.ones(magnitude_spectrum.shape, dtype=np.uint8)
         
-            # Change the drawing color from False to 0
-            cv2.circle(mask, (ccol, crow), mask_radius, 0, -1)
-        
-            # 3. Search for anomalous peaks in the non-central region
-            # Convert the uint8 mask to a boolean type for indexing
-            high_freq_spectrum = magnitude_spectrum[mask.astype(bool)]
-        
-            if high_freq_spectrum.size == 0:
-                return False
+        # Change the drawing color from False to 0
+        cv2.circle(mask, (ccol, crow), mask_radius, 0, -1)
 
-            # Calculate the mean and maximum values
-            mean_val = np.mean(high_freq_spectrum)
-            max_val = np.max(high_freq_spectrum)
-        
-            # 4. Determine if there is a significant peak
-            # If the maximum value is significantly higher than the average, it is likely caused by scan artifacts
-            if mean_val > 0 and max_val / mean_val > threshold_ratio:
-                print("[Info] Scan artifacts detected, enabling descreening process.")
-                return True
-            else:
-                print("[Info] No significant scan artifacts detected.")
-                return False
+        # 3. Analyze the high-frequency spectrum
+        # Search for anomalous peaks in the non-central region
+        # Convert the uint8 mask to a boolean type for indexing
+        high_freq_spectrum = magnitude_spectrum[mask.astype(bool)]
+
+        if high_freq_spectrum.size == 0:
+            return 0.0
+
+        # Calculate the mean and maximum values
+        mean_val = np.mean(high_freq_spectrum)
+        max_val = np.max(high_freq_spectrum)
+
+        # 4. Return the score instead of a boolean
+        # If mean_val is zero, return 0.0 to avoid division by zero
+        if mean_val > 0:
+            score = max_val / mean_val
+            # print(f"[Info] Calculated Scan Artifact Score: {score:.2f}")
+            return score
+        else:
+            # print("[Info] No significant high-frequency components found.")
+            return 0.0
 
     def reduce_texture_camera_raw_style(self, l_channel_uint8: np.ndarray,
                                         strength: float = 0.6,
@@ -887,10 +900,11 @@ class MangaColorizator:
             return sharpened
 
     def colorize(self, use_original_l: bool = True, descreen_mode: str = 'auto',
+                     post_processing_descreen_threshold: float = 1.5,
                      descreen_method: str = 'guided', 
                      descreen_strength: float = 0.8, guided_filter_radius: int = 4, guided_filter_eps: float = 200.0,
-                     protect_text_via_mask: bool = True, masking_method: str = 'text', 
-                     sharpen_if_no_text_protect: float = 0.0):
+                     protect_text_via_mask: bool = True, masking_method: str = 'color', 
+                     descreen_sharpen_strength: float = 0.0):
             """
             Perform colorization.
         
@@ -905,7 +919,7 @@ class MangaColorizator:
                 guided_filter_eps (float): The smoothing strength for the 'guided' method.
                 protect_text_via_mask (bool): Whether to enable a mask to protect details.
                 masking_method (str): The method for generating the mask. Options are 'text' (based on luminance) or 'color' (based on color saturation).
-                sharpen_if_no_text_protect (float): The sharpening strength when applying global descreening. This is applied to the L channel. Set to 0 to disable. Recommended values are 0.3-0.5.
+                descreen_sharpen_strength (float): The sharpening strength when applying global descreening. This is applied to the L channel. Set to 0 to disable. Recommended values are 0.3-0.5.
             """
             with torch.no_grad():
                 fake_color, _ = self.colorizer(torch.cat([self.current_image, self.current_hint], 1))
@@ -949,11 +963,11 @@ class MangaColorizator:
                     apply_descreening = True
                 elif descreen_mode == 'auto':
                     # Directly read the stored state, no need to detect again
-                    if self.scan_artifacts_detected is None:
-                        print("[Warning] Scan artifact detection has not been run. Please call set_image first.")
-                        apply_descreening = False
+                    if self.scan_artifact_score > post_processing_descreen_threshold:
+                        print(f"[Info] Post-processing descreen triggered (Score {self.scan_artifact_score:.2f} > Loose Threshold {post_processing_descreen_threshold}).")
+                        apply_descreening = True
                     else:
-                        apply_descreening = self.scan_artifacts_detected
+                        print(f"[Info] Post-processing descreen skipped (Score {self.scan_artifact_score:.2f} <= Loose Threshold {post_processing_descreen_threshold}).")
 
                 if apply_descreening:
                     # Descreening method selection logic
@@ -996,8 +1010,8 @@ class MangaColorizator:
                         final_l = l_descreened
 
                     # If the user has specified a sharpening strength, perform sharpening
-                    if sharpen_if_no_text_protect > 0:
-                        final_l = self._sharpen_l_channel(final_l, amount=sharpen_if_no_text_protect)
+                    if descreen_sharpen_strength > 0:
+                        final_l = self._sharpen_l_channel(final_l, amount=descreen_sharpen_strength)
 
                 # 3. Resize the 'a' and 'b' channels from the model output to match the proc_l image's size
                 target_h, target_w = final_l.shape
