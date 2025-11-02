@@ -2,6 +2,7 @@
 
 import torch.nn as nn
 import math
+from torch.utils.checkpoint import checkpoint
 
 '''https://github.com/blandocs/Tag2Pix/blob/master/model/pretrained.py'''
 
@@ -24,6 +25,17 @@ class Selayer(nn.Module):
 
         return x * out
 
+# A simple wrapper to make it compatible with the checkpoint function.
+# The checkpoint function doesn't handle modules that return multiple values
+# or forwards that require extra parameters well.
+# But for simple cases like BottleneckX_Origin (forward(self, x)), it can be used directly.
+class CheckpointWrapper(nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, x):
+        return checkpoint(self.module, x, use_reentrant=False)
 
 class BottleneckX_Origin(nn.Module):
     expansion = 4
@@ -71,11 +83,12 @@ class BottleneckX_Origin(nn.Module):
         return out
 
 class SEResNeXt_Origin(nn.Module):
-    def __init__(self, block, layers, input_channels=3, cardinality=32, num_classes=1000):
+    def __init__(self, block, layers, input_channels=3, cardinality=32, num_classes=1000, use_checkpoint: bool=False):
         super(SEResNeXt_Origin, self).__init__()
         self.cardinality = cardinality
         self.inplanes = 64
         self.input_channels = input_channels
+        self.use_checkpoint = use_checkpoint
 
         self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=7, stride=2, padding=3,
                                bias=False)
@@ -106,18 +119,38 @@ class SEResNeXt_Origin(nn.Module):
             )
 
         layers = []
-        layers.append(block(self.inplanes, planes, self.cardinality, stride, downsample))
+        # The first block in this layer may apply downsampling and stride.
+        first_block = block(self.inplanes, planes, self.cardinality, stride, downsample)
+        # If checkpointing is enabled, wrap it with CheckpointWrapper.
+        if self.training and self.use_checkpoint:
+            layers.append(CheckpointWrapper(first_block))
+        else:
+            layers.append(first_block)
+
         self.inplanes = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.inplanes, planes, self.cardinality))
+        # remaining blocks with stride=1
+        for _ in range(1, blocks):
+            inner_block = block(self.inplanes, planes, self.cardinality)
+
+            if self.training and self.use_checkpoint:
+                layers.append(CheckpointWrapper(inner_block))
+            else:
+                layers.append(inner_block)
 
         return nn.Sequential(*layers)
 
     def forward(self, x):
-        
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x1 = self.relu(x)
+        def initial_block_forward(tensor):
+            """A simple helper function to execute the operations we want to wrap."""
+            tensor = self.conv1(tensor)
+            tensor = self.bn1(tensor)
+            tensor = self.relu(tensor)
+            return tensor
+
+        if self.training and self.use_checkpoint:
+            x1 = checkpoint(initial_block_forward, x, use_reentrant=False)
+        else:
+            x1 = initial_block_forward(x)
         
         x2 = self.layer1(x1)
         

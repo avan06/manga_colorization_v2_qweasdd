@@ -104,7 +104,7 @@ class Generator(nn.Module):
         
         self.use_checkpoint = use_checkpoint
 
-        self.encoder = SEResNeXt_Origin(BottleneckX_Origin, [3, 4, 6, 3], num_classes= 370, input_channels=1)
+        self.encoder = SEResNeXt_Origin(BottleneckX_Origin, [3, 4, 6, 3], num_classes= 370, input_channels=1, use_checkpoint=self.use_checkpoint)
         
         self.to0 =  self._make_encoder_block_first(5, 32)
         self.to1 = self._make_encoder_block(32, 64)
