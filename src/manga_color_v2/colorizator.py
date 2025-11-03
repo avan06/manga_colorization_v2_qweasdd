@@ -26,6 +26,7 @@ def load_weights_intelligently(model, source, device='cpu'):
         (this handles dropout insertion automatically because dropout has no params and thus no keys)
       - Verifies tensor shapes before assigning
       - Loads using strict=False and reports stats
+      - Handles internal '.module.' inserted by CheckpointWrapper, ONLY during inference (model.training is False).
     """
     # --- load source into `raw_sd` ---
     if isinstance(source, str): # If a path is passed
@@ -186,7 +187,31 @@ def load_weights_intelligently(model, source, device='cpu'):
 
     try_direct_mappings()
 
-    # 2) Tunnel block sequential alignment mapping (robust Dropout handling)
+    # 2) Handle CheckpointWrapper's '.module.' insertion
+    # This new step specifically looks for keys that failed direct mapping
+    # and tries again after removing the internal '.module.'.
+    def map_checkpoint_wrapper_keys():
+        nonlocal loaded_count
+        for k_src, v_src in list(sd.items()):
+            if k_src in assigned_src_keys:
+                continue # Skip if already loaded by a previous method
+
+            # Create a candidate key by replacing the internal '.module.'
+            k_tgt_candidate = k_src.replace('.module.', '.')
+
+            # Check if this new candidate key exists in the target model's state_dict
+            if k_tgt_candidate in target_sd and tuple(v_src.shape) == tuple(target_sd[k_tgt_candidate].shape):
+                # If it exists and shapes match, we have a winner.
+                new_state[k_tgt_candidate] = v_src.clone()
+                loaded_count += 1
+                assigned_src_keys.add(k_src)
+
+    # only run this remapping logic if the model is in evaluation mode.
+    if not model.training:
+        print("[Loader] Activating CheckpointWrapper remapping...")
+        map_checkpoint_wrapper_keys()
+
+    # 3) Tunnel block sequential alignment mapping (robust Dropout handling)
     for simple_t in tunnels_simple:
         src_map = src_prefix_map.get(simple_t, {})
         tgt_map = tgt_prefix_map.get(simple_t, {})
@@ -333,12 +358,12 @@ class MangaColorizator:
         max_aspect_ratio: float = 2.5
     ):
         self.colorizer = Colorizer().to(device)
+        
+        self.colorizer = self.colorizer.eval()
 
         # In inference, we load weights directly into the generator submodule,
         # which is what the training script saves as the inference model.
         load_weights_intelligently(self.colorizer.generator, source=generator_path, device=device)
-        
-        self.colorizer = self.colorizer.eval()
         
         self.denoiser = FFDNetDenoiser(device, _weights_dir=denoising_dir)
 
