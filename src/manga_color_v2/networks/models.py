@@ -344,15 +344,19 @@ class ResNeXtBottleneck_D(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024, use_checkpoint: bool = False,):
+    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024, use_checkpoint: bool = False, use_hybrid: bool = True):
         """
-        ndf: Number of base feature maps in the discriminator
-        input_nc: Number of channels in the input image (3 for a color image)
-        sketch_feature_nc: Number of channels in the sketch feature map from the generator's Encoder
+        Args:
+            ndf (int): Number of base feature maps in the discriminator.
+            input_nc (int): Number of channels in the input image (3 for a color image).
+            sketch_feature_nc (int): Number of channels in the sketch feature map from the generator's Encoder.
+            use_checkpoint (bool): If True, use checkpointing to save memory during training.
+            use_hybrid (bool): If True, use a hybrid of global and patch scores; otherwise, use only patch scores.
         """
         super(Discriminator, self).__init__()
         # Add a property to control whether to use checkpoint
         self.use_checkpoint = use_checkpoint
+        self.use_hybrid = use_hybrid
 
         # Part 1: Process the color image with progressive downsampling
         self.feed = nn.Sequential(
@@ -372,14 +376,14 @@ class Discriminator(nn.Module):
             nn.Conv2d(ndf * 2, ndf * 4, kernel_size=1, stride=1, padding=0, bias=False), # -> (batch, 256, 64, 64)
             nn.LeakyReLU(0.2, True),
             
-            # Remove the last downsampling, change stride from 2 to 1
-            # This makes the output feature map size 64x64, which matches sketch_feat (x4)
+            # Removed the last downsampling by changing stride from 2 to 1.
+            # This makes the output feature map size 64x64, which matches the sketch_feat (x4).
             ResNeXtBottleneck_D(ndf * 4, ndf * 4, cardinality=8, dilate=1, stride=1),
         )
 
         # Part 2: Fuse sketch features and image features
-        # Input channels = image features (ndf*4) + sketch features (sketch_feature_nc)
-        # AlacGAN's NetI outputs 512 channels, while our Encoder's x4 outputs 1024, so an adjustment is needed here.
+        # The number of input channels is the sum of image features (ndf*4) and sketch features (sketch_feature_nc).
+        # AlacGAN's NetI outputs 512 channels, while our Encoder's x4 outputs 1024, so an adjustment is made here.
         self.fuse = nn.Sequential(
             nn.Conv2d(ndf * 4 + sketch_feature_nc, ndf * 8, kernel_size=3, stride=1, padding=1, bias=False), # -> (batch, 512, 64, 64)
             nn.LeakyReLU(0.2, True),
@@ -388,19 +392,25 @@ class Discriminator(nn.Module):
             ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 8, 8)
         )
         
-        # Final output layer
-        self.output = nn.Sequential(
-            # 1. Adaptive average pooling layer to convert any HxW input to 1x1
-            nn.AdaptiveAvgPool2d((1, 1)),
-            # 2. Use a 1x1 convolution layer to produce the final 1-channel score
-            nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=False)
-        )
+        # Final 1x1 convolution to produce the output logits map (PatchGAN).
+        # This preserves spatial dimensions for patch-wise scoring.
+        self.output_conv = nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=False)
+        
+        # Initialize components for the hybrid scoring mechanism.
+        if self.use_hybrid:
+            # Global branch: Adaptive pooling to collapse spatial features into a single vector for global score.
+            self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
 
     def forward(self, color_image, sketch_features):
         """
-        color_image: (batch, 3, H, W) The real or generated color image
-        sketch_features: (batch, 1024, H/16, W/16) Sketch features (x4) extracted from the generator's encoder
+        Args:
+            color_image (torch.Tensor): (batch, 3, H, W) The real or generated color image.
+            sketch_features (torch.Tensor): (batch, 1024, H/16, W/16) Sketch features (x4) extracted from the generator's encoder.
+        
+        Returns:
+            torch.Tensor: A scalar score for each image in the batch.
+            torch.Tensor: The final logit map for visualization.
         """
         # Process the image
         if self.training and self.use_checkpoint:
@@ -414,14 +424,31 @@ class Discriminator(nn.Module):
         
             # Fuse features
             # Concatenate along the channel dimension using torch.cat
-            # Now image_feat (64x64) and sketch_features (64x64) have matching dimensions
+            # Now image_feat (64x64) and sketch_features (64x64) have matching spatial dimensions
             combined_feat = torch.cat([image_feat, sketch_features], 1)
         
             # Process the fused features
             fused_output = self.fuse(combined_feat)
-        
-        # Get the final score
-        score = self.output(fused_output) # (batch, 1, 1, 1)
-        
-        # Return a scalar score
-        return score.view(-1)
+
+        # Step 1: Calculate the local (patch-based) logits map, which is used in all modes.
+        # This map contains a grid of scores for different regions of the image.
+        logits_map = self.output_conv(fused_output)  # -> [B, 1, 8, 8]
+
+        # Step 2: Calculate the patch score by averaging the logits map.
+        # This serves as the final score in standard PatchGAN mode, or as the local component in hybrid mode.
+        patch_score = logits_map.mean(dim=[2, 3]).view(-1) # -> [B]
+
+        # Step 3: Determine the final score based on the operating mode.
+        if self.use_hybrid:
+            # In hybrid mode, also compute a global score.
+            global_feat = self.global_pool(fused_output)    # -> [B, 512, 1, 1]
+            global_score = self.output_conv(global_feat).view(-1) # -> [B]
+            
+            # Combine global and local scores to get the final hybrid score.
+            final_score = 0.6 * global_score + 0.4 * patch_score
+        else:
+            # In standard PatchGAN mode, the final score is simply the patch score.
+            final_score = patch_score
+
+        # Return the final calculated score and the logits map for potential visualization.
+        return final_score, logits_map
