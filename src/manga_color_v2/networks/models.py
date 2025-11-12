@@ -344,8 +344,10 @@ class ResNeXtBottleneck_D(nn.Module):
 
 
 class Discriminator(nn.Module):
-    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024, use_checkpoint: bool = False, use_hybrid: bool = True):
+    def __init__(self, ndf=64, input_nc=3, sketch_feature_nc=1024, use_checkpoint: bool = False, use_hybrid: bool = True, alpha_clamp_eps: float = 1e-2):
         """
+        Discriminator with separate patch/global heads and a learnable alpha (sigmoid(logit_alpha)).
+        alpha initially set to 0 -> sigmoid(0) = 0.5
         Args:
             ndf (int): Number of base feature maps in the discriminator.
             input_nc (int): Number of channels in the input image (3 for a color image).
@@ -357,6 +359,7 @@ class Discriminator(nn.Module):
         # Add a property to control whether to use checkpoint
         self.use_checkpoint = use_checkpoint
         self.use_hybrid = use_hybrid
+        self.alpha_clamp_eps = alpha_clamp_eps
 
         # Part 1: Process the color image with progressive downsampling
         self.feed = nn.Sequential(
@@ -375,7 +378,7 @@ class Discriminator(nn.Module):
             ResNeXtBottleneck_D(ndf * 2, ndf * 2, cardinality=8, dilate=1, stride=2),  # -> (batch, 128, 64, 64)
             nn.Conv2d(ndf * 2, ndf * 4, kernel_size=1, stride=1, padding=0, bias=False), # -> (batch, 256, 64, 64)
             nn.LeakyReLU(0.2, True),
-            
+
             # Removed the last downsampling by changing stride from 2 to 1.
             # This makes the output feature map size 64x64, which matches the sketch_feat (x4).
             ResNeXtBottleneck_D(ndf * 4, ndf * 4, cardinality=8, dilate=1, stride=1),
@@ -391,26 +394,44 @@ class Discriminator(nn.Module):
             ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 16, 16)
             ResNeXtBottleneck_D(ndf * 8, ndf * 8, cardinality=8, dilate=1, stride=2), # -> (batch, 512, 8, 8)
         )
-        
-        # Final 1x1 convolution to produce the output logits map (PatchGAN).
-        # This preserves spatial dimensions for patch-wise scoring.
-        self.output_conv = nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=False)
-        
-        # Initialize components for the hybrid scoring mechanism.
-        if self.use_hybrid:
-            # Global branch: Adaptive pooling to collapse spatial features into a single vector for global score.
-            self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
+        # --- patch head (1x1 conv) ---
+        self.output_conv_patch = nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=False)
+
+        # --- global head (adaptive pool + 1x1 conv) ---
+        if self.use_hybrid:
+            self.global_head = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),
+                nn.Conv2d(ndf * 8, 1, kernel_size=1, stride=1, padding=0, bias=True)
+            )
+
+        # learnable logit parameter for alpha. init 0 => sigmoid(0)=0.5
+        self.logit_alpha = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
 
     def forward(self, color_image, sketch_features):
         """
+        Performs the forward pass of the Discriminator.
+
         Args:
-            color_image (torch.Tensor): (batch, 3, H, W) The real or generated color image.
-            sketch_features (torch.Tensor): (batch, 1024, H/16, W/16) Sketch features (x4) extracted from the generator's encoder.
-        
+            color_image (torch.Tensor): The real or generated color image.
+                                        Shape: (batch_size, 3, H, W).
+            sketch_features (torch.Tensor): The intermediate feature map from the generator's encoder.
+                                            For a 512x512 input, this feature map is 64x64.
+                                            Shape: (batch_size, 1024, H/8, W/8).
+
         Returns:
-            torch.Tensor: A scalar score for each image in the batch.
-            torch.Tensor: The final logit map for visualization.
+            A tuple containing:
+                - final_score (torch.Tensor): The final discriminator score for each item in the batch.
+                  If use_hybrid is True, this is a weighted sum of the global and patch scores.
+                  Otherwise, it is just the patch score. Shape: (batch_size,).
+                - logits_map (torch.Tensor): The map of patch-level logits before averaging.
+                  For a 512x512 input, the map is 8x8. Shape: (batch_size, 1, H/64, W/64).
+                - global_score (torch.Tensor or None): The global discriminator score.
+                  This is only computed if use_hybrid is True; otherwise, it is None. Shape: (batch_size,).
+                - patch_score (torch.Tensor): The patch discriminator score, obtained by averaging the logits_map.
+                  Shape: (batch_size,).
+                - alpha (torch.Tensor): The learned scalar weight used to combine global and patch scores.
+                  It is a single value tensor, clamped between (alpha_clamp_eps, 1.0 - alpha_clamp_eps).
         """
         # Process the image
         if self.training and self.use_checkpoint:
@@ -424,31 +445,38 @@ class Discriminator(nn.Module):
         
             # Fuse features
             # Concatenate along the channel dimension using torch.cat
-            # Now image_feat (64x64) and sketch_features (64x64) have matching spatial dimensions
+            # Now image_feat (e.g., 64x64) and sketch_features (e.g., 64x64) have matching spatial dimensions
             combined_feat = torch.cat([image_feat, sketch_features], 1)
         
             # Process the fused features
             fused_output = self.fuse(combined_feat)
 
+        # --- Calculate scores ---
+
         # Step 1: Calculate the local (patch-based) logits map, which is used in all modes.
         # This map contains a grid of scores for different regions of the image.
-        logits_map = self.output_conv(fused_output)  # -> [B, 1, 8, 8]
-
+        logits_map = self.output_conv_patch(fused_output)  # [B, 1, H/64, W/64]
+        
         # Step 2: Calculate the patch score by averaging the logits map.
         # This serves as the final score in standard PatchGAN mode, or as the local component in hybrid mode.
-        patch_score = logits_map.mean(dim=[2, 3]).view(-1) # -> [B]
+        patch_score = logits_map.mean(dim=[2, 3]).view(-1)  # [B]
 
-        # Step 3: Determine the final score based on the operating mode.
+        global_score = None
+        # Step 3: If in hybrid mode, compute the global score.
         if self.use_hybrid:
-            # In hybrid mode, also compute a global score.
-            global_feat = self.global_pool(fused_output)    # -> [B, 512, 1, 1]
-            global_score = self.output_conv(global_feat).view(-1) # -> [B]
-            
-            # Combine global and local scores to get the final hybrid score.
-            final_score = 0.6 * global_score + 0.4 * patch_score
+            # Compute a single global scalar via the dedicated global head.
+            global_score = self.global_head(fused_output).view(-1)  # [B]
+
+        # Step 4: Calculate the final score based on the mode.
+        # The weight 'alpha' is learned and clamped to avoid extreme values (0 or 1).
+        alpha = torch.sigmoid(self.logit_alpha)
+        alpha = torch.clamp(alpha, self.alpha_clamp_eps, 1.0 - self.alpha_clamp_eps)
+
+        if self.use_hybrid:
+            # In hybrid mode, the final score is a weighted average of global and patch scores.
+            final_score = alpha * global_score + (1.0 - alpha) * patch_score
         else:
-            # In standard PatchGAN mode, the final score is simply the patch score.
+            # In standard (patch-only) mode, the final score is just the patch score.
             final_score = patch_score
 
-        # Return the final calculated score and the logits map for potential visualization.
-        return final_score, logits_map
+        return final_score, logits_map, global_score, patch_score, alpha
